@@ -1,0 +1,6 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(CCCL CONFIG COMPONENTS CUB)
+
+include("${CMAKE_CURRENT_LIST_DIR}/histocacheTargets.cmake")
