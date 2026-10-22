@@ -7,6 +7,11 @@ Consumes a per-cell sweep JSON (each high-bin algorithm forced across
 SampleT x Elements x Bins x InputShape, per benchmark binary) and the
 source-of-truth input generators in `histogram_input_design.py`.
 
+Optional `--raw-results` inputs add the preserved raw-autoresearch selector as a
+third reference series. RAW is normalized to the upstream baseline measured in
+the same historical run, while the current selector is normalized to the current
+upstream baseline.
+
 Layout (one image per InputShape, inside a folder per transform/channels/type):
   algo_perf_figs/<even|range>_<single|multi>_<I32|F64>/<input_shape>.png
 By default, performance graphs fill the left side while the input characterization,
@@ -77,6 +82,13 @@ BINARY_META = {
 ALGO_STYLE = {
     "default": ("#000000", "*", "selected default", "-", 2.2),
     "main": ("#e6194B", "X", "baseline (upstream main)", "-.", 2.2),
+    "raw_autoresearch": (
+        "#f58231",
+        "o",
+        "raw autoresearch selector",
+        "--",
+        1.8,
+    ),
     "gmem_privatized_nocache": (
         "#9467bd",
         "^",
@@ -186,6 +198,7 @@ ALGO_STYLE = {
 # `gmem_privatized_nocache:hybrid`, which the sweep stores verbatim, so map both the
 # member-suffixed name and the bare `hybrid` here.
 ALGO_TAG = {
+    "raw_autoresearch": "RAW",
     "smem_privatized": "SMP",
     "gmem_privatized_nocache": "GPN",
     "gmem_privatized_agent": "GPA",
@@ -366,9 +379,15 @@ ALGO_ORDER = [
     "direct_single_probe__nocoal",
     "direct_nocache",
     "direct_nocache__nocoal",
+    "raw_autoresearch",
     "main",
     "default",
 ]
+
+# These inputs are already speedups against their own contemporaneous baseline.
+# They must not be divided by the current run's `main` throughput: doing so would
+# mix measurements taken from different upstream revisions and machine states.
+NORMALIZED_SPEEDUP_SERIES = {"raw_autoresearch"}
 
 # Cache implementation represented by each hit-rate series. A title names every
 # algorithm that shares the cache design, then identifies the specific measured
@@ -606,18 +625,23 @@ def draw_perf(ax, series, title, default_tags=None):
         # this panel (see below): log2 only when something exceeds 2x (so a wide dynamic
         # range stays legible), otherwise a plain linear scale.
         max_sp = 0.0
-        # Every algorithm EXCEPT main, divided by main at the shared bin points.
+        # Every current-run algorithm except main is divided by current main at the
+        # shared bin points. Historical comparison series carry speedups normalized
+        # against their own matched historical baseline.
         drawn = [
             a for a in ALGO_ORDER if a != "main" and a in series and len(series[a][0])
         ]
         for i, algo in enumerate(drawn):
             color, marker, label, ls, lw = ALGO_STYLE[algo]
             xb, yv = series[algo]
-            pts = [
-                (int(x), y / baseline[int(x)])
-                for x, y in zip(xb, yv)
-                if int(x) in baseline
-            ]
+            if algo in NORMALIZED_SPEEDUP_SERIES:
+                pts = [(int(x), y) for x, y in zip(xb, yv) if y > 0]
+            else:
+                pts = [
+                    (int(x), y / baseline[int(x)])
+                    for x, y in zip(xb, yv)
+                    if int(x) in baseline
+                ]
             if not pts:
                 continue
             any_pts = True
@@ -905,6 +929,53 @@ def geomean_selected_tags(per_algo_cells, sample, elements, shapes):
     return tags
 
 
+def add_raw_autoresearch_series(data, raw_results_paths):
+    """Add raw selector speedups, each normalized to its historical baseline.
+
+    Every raw input uses the normal sweep schema (`default` and `main` GiB/s).
+    Later inputs override earlier inputs at the same cell, which allows a focused
+    final characterization to supersede an older comprehensive sweep without
+    inventing values for cells it did not measure.
+    """
+    if not raw_results_paths:
+        return
+
+    target_keys = {
+        binary_label: set(per_algo_cells.get("default", {}))
+        & set(per_algo_cells.get("main", {}))
+        for binary_label, per_algo_cells in data.items()
+        if not binary_label.startswith("_") and binary_label in BINARY_META
+    }
+    merged = {}
+    for path in raw_results_paths:
+        if not os.path.exists(path):
+            raise SystemExit(f"missing raw autoresearch JSON: {path}")
+        raw_data = json.load(open(path))
+        for binary_label, per_algo_cells in raw_data.items():
+            if binary_label.startswith("_") or binary_label not in BINARY_META:
+                continue
+            raw_default = per_algo_cells.get("default", {})
+            raw_main = per_algo_cells.get("main", {})
+            binary_speedups = merged.setdefault(binary_label, {})
+            for key in raw_default.keys() & raw_main.keys():
+                target_key = key
+                if target_key not in target_keys.get(binary_label, set()):
+                    # The comprehensive July run used the implicit default spelling;
+                    # later runs made the same 0.10 phase length explicit in the key.
+                    if key.endswith("|temporal_phases"):
+                        target_key = key + ":0.10"
+                if target_key not in target_keys.get(binary_label, set()):
+                    continue
+                default_gibs = raw_default[key]
+                main_gibs = raw_main[key]
+                if default_gibs > 0 and main_gibs > 0:
+                    binary_speedups[target_key] = default_gibs / main_gibs
+
+    for binary_label, speedups in merged.items():
+        if binary_label in data and speedups:
+            data[binary_label]["raw_autoresearch"] = speedups
+
+
 def render_geomean(
     binary_label,
     per_algo_cells,
@@ -950,7 +1021,7 @@ def render_geomean(
         subtitle = (
             "speedup vs baseline (×, log2) vs #bins per input size — geomean of GiB/s across all "
             "shapes; one line per algorithm, baseline (upstream main) = 1×; default points tagged "
-            "with the selected algorithm"
+            "with the selected algorithm; RAW is normalized to its own historical baseline"
         )
     else:
         subtitle = (
@@ -1120,7 +1191,7 @@ def render_one(
     head = "\n".join(textwrap.wrap(head, width=wrap_width))
     perf_note = (
         "speedup vs baseline vs #bins; baseline (upstream main) = 1×; default points tagged "
-        "with the selected algorithm"
+        "with the selected algorithm; RAW uses its own historical baseline"
         if "main" in per_algo_cells
         else "absolute GiB/s vs #bins"
     )
@@ -1246,6 +1317,13 @@ def main():
         help="per-cell perf sweep JSON (binary -> algo -> 'SampleT|Elements|Bins|InputShape')",
     )
     ap.add_argument(
+        "--raw-results",
+        action="append",
+        default=[],
+        help="raw-autoresearch sweep JSON to add as RAW = default/raw-main speedup; "
+        "repeat to layer focused later runs over an earlier comprehensive run",
+    )
+    ap.add_argument(
         "--hitrate",
         default="hitrate_results.json",
         help="per-cell hit-rate sweep JSON "
@@ -1280,6 +1358,9 @@ def main():
     if not os.path.exists(args.results):
         raise SystemExit(f"missing results JSON: {args.results} (pass --results)")
     data = json.load(open(args.results))
+    add_raw_autoresearch_series(data, args.raw_results)
+    if args.raw_results:
+        print("raw autoresearch data: " + ", ".join(args.raw_results))
     hitrate = {}
     if args.hitrate and os.path.exists(args.hitrate):
         hitrate = json.load(open(args.hitrate))

@@ -63,6 +63,24 @@ python histogram_algo_perf.py --results sweep_results.json \
     [--hitrate hitrate_results.json] --outdir algo_perf_figs
 ```
 
+To add preserved raw-autoresearch performance, pass one or more historical sweep
+files in chronological order. The plotter draws `RAW` as the historical selector's
+speedup against the upstream baseline measured in the same historical run. Later
+files override earlier measurements at identical cells, so a focused final sweep
+can refine a preceding comprehensive sweep:
+
+```text
+python histogram_algo_perf.py \
+    --results sweep_results.json \
+    --raw-results run_2026-07-09/algo_sweep_full.json \
+    --raw-results run_2026-07-17_highbin_algos/algo_sweep_full.json \
+    --outdir algo_perf_figs
+```
+
+Only cells present in the current result matrix are imported. The July spelling
+`temporal_phases` is treated as the current explicit `temporal_phases:0.10` spelling.
+No missing measurements are interpolated.
+
 ## 3. `histogram_algo_sweep.py` — produce the perf JSON (incl. upstream `main`)
 Drives the sweep the plot script consumes. For every
 `(binary, SampleT, Elements, Bins, InputShape)` cell it forces each high-bin
